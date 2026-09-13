@@ -15,7 +15,7 @@ _DIS_FLOW = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
 if len(sys.argv) > 1:
     video_path = sys.argv[1]
 else:
-    video_path = r"c:\Users\User\workspace\missile_detection\20.mp4"
+    video_path = r"C:\ofir\1.mp4"
 
 class MissileTracker:
 
