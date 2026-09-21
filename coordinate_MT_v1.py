@@ -1,209 +1,427 @@
-from __future__ import annotations
+"""
+2D Trajectory Classifier — Starter Project
+============================================
+Classifies a flight/trajectory (given as a sequence of 2D coordinates,
+x = downrange distance, y = altitude) into one of several kinematic
+classes:
 
-from dataclasses import asdict, dataclass
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+    ballistic_standard   - classic parabolic ballistic arc
+    lofted                - high launch angle, high apogee ballistic arc
+    depressed             - low launch angle, flat ballistic arc
+    boost_glide           - boosts, then glides with reduced effective gravity
+    maneuvering_cruise    - near-constant altitude with periodic maneuvers
+
+WHY SIMULATION-BASED DATA?
+Real missile telemetry is not publicly available (and is often classified
+or export-controlled). The standard approach in the published literature
+(see e.g. AIAA SciTech 2025 "FDA Preprocessing... Missile Classification",
+and "Dynamic classification of ballistic missiles using neural networks and
+HMMs", Singh & Padmanabhan 2014) is to:
+  1. Simulate physically plausible trajectories from equations of motion.
+  2. Extract kinematic features (altitude, velocity, acceleration, angles).
+  3. Train a classifier (NN, RF, HMM, k-NN+DTW, etc.) on those features.
+This script implements that full pipeline end-to-end so you can extend it
+with your own physics, real radar/optical-tracking data, or deep sequence
+models (LSTM/Transformer) later.
+
+PIPELINE
+  1. Physics-based simulators generate labeled (x, y) trajectories.
+  2. Feature extraction converts each raw trajectory into a fixed-length
+     feature vector (works for variable-length flights).
+  3. A classifier (Random Forest by default) is trained and evaluated.
+  4. A CLI lets you classify a new trajectory from a CSV of x,y points.
+
+HOW TO EXTEND
+  - Swap extract_features() with an LSTM/GRU consuming the raw (x,y) series
+    directly (see the "next_steps" notes at the bottom of this file).
+  - Feed in real radar/optical tracking data (e.g. from your OpenCV/CV
+    pipeline) in place of the simulators.
+  - Add measurement noise models matching your actual sensor.
+"""
 
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import joblib
+import argparse
+import sys
 
-Point2D = Tuple[float, float]
-
-
-@dataclass
-class TrajectoryResult:
-    object_id: str
-    label: str
-    score: float
-    confidence: str
-    samples: int
-    path_length: float
-    mean_speed: float
-    speed_cv: float
-    mean_acceleration: float
-    heading_change_deg: float
-    straightness: float
-    reasons: List[str]
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
 
 
-class TrajectoryMissileClassifier:
-    def __init__(
-        self,
-        min_points: int = 6,
-        min_path_length: float = 30.0,
-        min_mean_speed: float = 8.0,
-        max_speed_cv: float = 0.35,
-        max_heading_change_deg: float = 25.0,
-        min_straightness: float = 0.90,
-        positive_score_threshold: float = 0.72,
-    ) -> None:
-        self.min_points = min_points
-        self.min_path_length = min_path_length
-        self.min_mean_speed = min_mean_speed
-        self.max_speed_cv = max_speed_cv
-        self.max_heading_change_deg = max_heading_change_deg
-        self.min_straightness = min_straightness
-        self.positive_score_threshold = positive_score_threshold
+# ---------------------------------------------------------------------------
+# 1. PHYSICS-BASED TRAJECTORY SIMULATORS
+#    Each returns two numpy arrays: xs (downrange, m), ys (altitude, m)
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def _clamp01(value: float) -> float:
-        return float(np.clip(value, 0.0, 1.0))
+def simulate_ballistic(g=9.81, drag_k=0.0, v0_range=(300, 900),
+                        angle_range=(20, 70), dt=0.05, noise=0.0):
+    """Basic ballistic arc, optional quadratic drag term drag_k."""
+    v0 = np.random.uniform(*v0_range)
+    angle = np.radians(np.random.uniform(*angle_range))
+    vx, vy = v0 * np.cos(angle), v0 * np.sin(angle)
+    x, y = 0.0, 0.0
+    xs, ys = [x], [y]
+    while y >= 0:
+        speed = np.hypot(vx, vy)
+        ax = -drag_k * speed * vx
+        ay = -g - drag_k * speed * vy
+        vx += ax * dt
+        vy += ay * dt
+        x += vx * dt
+        y += vy * dt
+        xs.append(x)
+        ys.append(max(y, 0))
+        if len(xs) > 2000:
+            break
+    xs, ys = np.array(xs), np.array(ys)
+    if noise > 0:
+        xs = xs + np.random.normal(0, noise, size=xs.shape)
+        ys = ys + np.random.normal(0, noise, size=ys.shape)
+    return xs, ys
 
-    @staticmethod
-    def _as_points(coordinates: Sequence[Sequence[float]]) -> np.ndarray:
-        points = np.asarray(coordinates, dtype=float)
-        if points.ndim != 2 or points.shape[1] != 2:
-            raise ValueError("coordinates must have shape (N, 2), e.g. [[x1, y1], [x2, y2], ...]")
-        if not np.isfinite(points).all():
-            raise ValueError("coordinates must contain only finite numeric values")
-        return points
 
-    def classify_one(
-        self,
-        object_id: str,
-        coordinates: Sequence[Sequence[float]],
-        dt: float = 1.0,
-    ) -> TrajectoryResult:
-        if dt <= 0:
-            raise ValueError("dt must be greater than zero")
+def simulate_lofted(g=9.81, v0_range=(400, 1000), angle_range=(60, 85),
+                     dt=0.05, noise=0.0):
+    """High launch angle -> high apogee, short range."""
+    return simulate_ballistic(g=g, drag_k=0.00003, v0_range=v0_range,
+                               angle_range=angle_range, dt=dt, noise=noise)
 
-        p = self._as_points(coordinates)
-        n = len(p)
-        reasons: List[str] = []
 
-        if n < self.min_points:
-            return TrajectoryResult(
-                object_id=str(object_id), label="insufficient_data", score=0.0,
-                confidence="low", samples=n, path_length=0.0, mean_speed=0.0,
-                speed_cv=0.0, mean_acceleration=0.0, heading_change_deg=0.0,
-                straightness=0.0,
-                reasons=[f"Need at least {self.min_points} coordinate samples; received {n}."],
-            )
+def simulate_depressed(g=9.81, v0_range=(300, 700), angle_range=(5, 20),
+                        dt=0.05, noise=0.0):
+    """Low launch angle -> flat, fast, low-altitude trajectory."""
+    return simulate_ballistic(g=g, drag_k=0.00005, v0_range=v0_range,
+                               angle_range=angle_range, dt=dt, noise=noise)
 
-        displacements = np.diff(p, axis=0)
-        segment_lengths = np.linalg.norm(displacements, axis=1)
-        nonzero = segment_lengths > 1e-9
 
-        if nonzero.sum() < 2:
-            return TrajectoryResult(
-                object_id=str(object_id), label="not_missile_like", score=0.0,
-                confidence="high", samples=n, path_length=float(segment_lengths.sum()),
-                mean_speed=0.0, speed_cv=0.0, mean_acceleration=0.0,
-                heading_change_deg=0.0, straightness=0.0,
-                reasons=["Trajectory has too little movement to evaluate sustained motion."],
-            )
-
-        speeds = segment_lengths / dt
-        valid_vectors = displacements[nonzero]
-        valid_lengths = segment_lengths[nonzero]
-        unit_vectors = valid_vectors / valid_lengths[:, None]
-
-        dot_products = np.sum(unit_vectors[:-1] * unit_vectors[1:], axis=1)
-        turn_angles_deg = np.degrees(np.arccos(np.clip(dot_products, -1.0, 1.0)))
-
-        path_length = float(segment_lengths.sum())
-        net_displacement = float(np.linalg.norm(p[-1] - p[0]))
-        straightness = net_displacement / path_length if path_length > 1e-9 else 0.0
-        mean_speed = float(np.mean(speeds))
-        speed_cv = float(np.std(speeds) / (mean_speed + 1e-9))
-        mean_acceleration = float(np.mean(np.abs(np.diff(speeds) / dt))) if len(speeds) > 1 else 0.0
-        heading_change_deg = float(np.mean(turn_angles_deg)) if len(turn_angles_deg) else 0.0
-
-        length_score = self._clamp01(path_length / self.min_path_length)
-        speed_score = self._clamp01(mean_speed / self.min_mean_speed)
-        stability_score = self._clamp01(1.0 - speed_cv / self.max_speed_cv)
-        heading_score = self._clamp01(1.0 - heading_change_deg / self.max_heading_change_deg)
-        straightness_score = self._clamp01(
-            (straightness - (self.min_straightness - 0.15)) / 0.15
-        )
-
-        score = float(
-            0.15 * length_score
-            + 0.25 * speed_score
-            + 0.20 * stability_score
-            + 0.20 * heading_score
-            + 0.20 * straightness_score
-        )
-
-        if path_length < self.min_path_length:
-            reasons.append(f"Path length {path_length:.2f} is below the configured minimum {self.min_path_length:.2f}.")
+def simulate_boost_glide(g=9.81, v0_range=(500, 1200), angle_range=(30, 55),
+                          dt=0.05, noise=0.0):
+    """Boosts ballistically, then glides with reduced effective gravity
+    after apogee (crude stand-in for a lifting re-entry vehicle)."""
+    v0 = np.random.uniform(*v0_range)
+    angle = np.radians(np.random.uniform(*angle_range))
+    vx, vy = v0 * np.cos(angle), v0 * np.sin(angle)
+    x, y = 0.0, 0.0
+    xs, ys = [x], [y]
+    apogee_reached = False
+    glide_lift = np.random.uniform(0.3, 0.6)
+    while y >= 0:
+        speed = np.hypot(vx, vy)
+        if vy < 0 and not apogee_reached:
+            apogee_reached = True
+        if apogee_reached:
+            ax = -0.00002 * speed * vx
+            ay = -g * (1 - glide_lift) - 0.00002 * speed * vy
         else:
-            reasons.append(f"Sustained path length: {path_length:.2f}.")
+            ax = -0.00001 * speed * vx
+            ay = -g - 0.00001 * speed * vy
+        vx += ax * dt
+        vy += ay * dt
+        x += vx * dt
+        y += vy * dt
+        xs.append(x)
+        ys.append(max(y, 0))
+        if len(xs) > 2500:
+            break
+    xs, ys = np.array(xs), np.array(ys)
+    if noise > 0:
+        xs = xs + np.random.normal(0, noise, size=xs.shape)
+        ys = ys + np.random.normal(0, noise, size=ys.shape)
+    return xs, ys
 
-        if mean_speed < self.min_mean_speed:
-            reasons.append(f"Mean speed {mean_speed:.2f} is below the configured minimum {self.min_mean_speed:.2f}.")
-        else:
-            reasons.append(f"Mean speed meets the configured threshold: {mean_speed:.2f}.")
 
-        if speed_cv > self.max_speed_cv:
-            reasons.append(f"Speed is variable (coefficient of variation {speed_cv:.2f}).")
-        else:
-            reasons.append(f"Speed is comparatively stable (coefficient of variation {speed_cv:.2f}).")
+def simulate_maneuvering_cruise(v0_range=(200, 350), alt_range=(500, 2000),
+                                 dt=0.05, noise=0.0):
+    """Near-constant-altitude cruise with periodic sinusoidal maneuvers
+    (stand-in for a cruise-missile-like flight profile)."""
+    v0 = np.random.uniform(*v0_range)
+    alt = np.random.uniform(*alt_range)
+    total_time = np.random.uniform(60, 120)
+    n = int(total_time / dt)
+    xs = np.zeros(n)
+    ys = np.zeros(n)
+    ys[:] = alt
+    x = 0.0
+    freq = np.random.uniform(0.05, 0.15)
+    amp = np.random.uniform(50, 300)
+    for i in range(1, n):
+        x += v0 * dt
+        xs[i] = x
+        ys[i] = alt + amp * np.sin(freq * x / 100.0)
+    if noise > 0:
+        xs = xs + np.random.normal(0, noise, size=xs.shape)
+        ys = ys + np.random.normal(0, noise, size=ys.shape)
+    return xs, ys
 
-        if heading_change_deg > self.max_heading_change_deg:
-            reasons.append(f"Average heading change is high: {heading_change_deg:.1f} degrees.")
-        else:
-            reasons.append(f"Average heading change is low: {heading_change_deg:.1f} degrees.")
 
-        if straightness < self.min_straightness:
-            reasons.append(f"Trajectory straightness {straightness:.2f} is below the configured minimum {self.min_straightness:.2f}.")
-        else:
-            reasons.append(f"Trajectory is straight (straightness {straightness:.2f}).")
+SIMULATORS = {
+    'ballistic_standard': lambda noise: simulate_ballistic(noise=noise),
+    'lofted': lambda noise: simulate_lofted(noise=noise),
+    'depressed': lambda noise: simulate_depressed(noise=noise),
+    'boost_glide': lambda noise: simulate_boost_glide(noise=noise),
+    'maneuvering_cruise': lambda noise: simulate_maneuvering_cruise(noise=noise),
+}
 
-        label = "missile_like" if score >= self.positive_score_threshold else "not_missile_like"
-        decisive_features = sum([
-            path_length >= self.min_path_length,
-            mean_speed >= self.min_mean_speed,
-            speed_cv <= self.max_speed_cv,
-            heading_change_deg <= self.max_heading_change_deg,
-            straightness >= self.min_straightness,
-        ])
-        confidence = "high" if decisive_features >= 4 and abs(score - self.positive_score_threshold) >= 0.15 else "medium"
 
-        return TrajectoryResult(
-            object_id=str(object_id), label=label, score=round(score, 4), confidence=confidence,
-            samples=n, path_length=round(path_length, 4), mean_speed=round(mean_speed, 4),
-            speed_cv=round(speed_cv, 4), mean_acceleration=round(mean_acceleration, 4),
-            heading_change_deg=round(heading_change_deg, 4), straightness=round(straightness, 4),
-            reasons=reasons,
-        )
+# ---------------------------------------------------------------------------
+# 2. FEATURE EXTRACTION
+#    Converts a variable-length (x, y) trajectory into a fixed-length
+#    vector of physically meaningful features.
+# ---------------------------------------------------------------------------
 
-# receive by argument 
-    def classify_many(
-        self,
-        tracks: Mapping[str, Sequence[Sequence[float]]],
-        dt: float = 1.0,
-    ) -> Dict[str, Dict[str, object]]:
-        results: Dict[str, Dict[str, object]] = {}
-        for object_id, coordinates in tracks.items():
-            try:
-                results[str(object_id)] = asdict(self.classify_one(str(object_id), coordinates, dt))
-            except ValueError as exc:
-                results[str(object_id)] = {
-                    "object_id": str(object_id),
-                    "label": "invalid_input",
-                    "score": 0.0,
-                    "confidence": "low",
-                    "error": str(exc),
-                }
-        return results
+def extract_features(xs, ys):
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    n = len(xs)
 
-# 10 coordinates min
-if __name__ == "__main__":
-    tracks = {
-        "track_001": [
-            [0.0, 0.0], [8.7, 1.0], [22.5, 1.8], [29.1, 3.0],
-            [40.6, 4.0], [50.0, 5.2], [61.8, 6.0],
-        ],
-        "track_002": [
-            [0.0, 0.0], [3.0, 2.0], [5.0, 7.0], [2.0, 11.0],
-            [-3.0, 10.0], [-5.0, 5.0], [-2.0, 1.0],
-        ],
-        "track_003": [[10.0, 10.0], [10.1, 10.0], [10.0, 10.1]],
+    vx = np.diff(xs)
+    vy = np.diff(ys)
+    speed = np.hypot(vx, vy)
+    ax = np.diff(vx)
+    ay = np.diff(vy)
+    accel = np.hypot(ax, ay)
+
+    max_alt = ys.max()
+    range_total = xs[-1] - xs[0]
+    apogee_idx = int(np.argmax(ys))
+    apogee_frac = apogee_idx / n
+
+    mean_speed = speed.mean() if len(speed) else 0.0
+    max_speed = speed.max() if len(speed) else 0.0
+    min_speed = speed.min() if len(speed) else 0.0
+    speed_std = speed.std() if len(speed) else 0.0
+    mean_accel = accel.mean() if len(accel) else 0.0
+    accel_std = accel.std() if len(accel) else 0.0
+
+    launch_angle = np.degrees(np.arctan2(vy[0], vx[0])) if len(vy) else 0.0
+    impact_angle = np.degrees(np.arctan2(vy[-1], vx[-1])) if len(vy) else 0.0
+    aspect_ratio = max_alt / (range_total + 1e-6)
+
+    ascent_len = apogee_idx + 1 if apogee_idx > 0 else n
+    descent_len = n - apogee_idx
+    ascent_descent_ratio = ascent_len / (descent_len + 1e-6)
+
+    curvature_proxy = accel_std / (mean_speed + 1e-6)
+    vy_sign_changes = int(np.sum(np.diff(np.sign(vy)) != 0)) if len(vy) > 1 else 0
+
+    return {
+        'max_altitude': max_alt,
+        'range_total': range_total,
+        'apogee_fraction': apogee_frac,
+        'flight_time_steps': n,
+        'mean_speed': mean_speed,
+        'max_speed': max_speed,
+        'min_speed': min_speed,
+        'speed_std': speed_std,
+        'mean_accel': mean_accel,
+        'accel_std': accel_std,
+        'launch_angle_deg': launch_angle,
+        'impact_angle_deg': impact_angle,
+        'aspect_ratio': aspect_ratio,
+        'ascent_descent_ratio': ascent_descent_ratio,
+        'curvature_proxy': curvature_proxy,
+        'vy_sign_changes': vy_sign_changes,
     }
 
-    classifier = TrajectoryMissileClassifier()
-    results = classifier.classify_many(tracks, dt=1.0)
 
-    for object_id, result in results.items():
-        print(f"\n{object_id}: {result['label']} | score={result['score']} | confidence={result['confidence']}")
-        for reason in result.get("reasons", []):
-            print(f"  - {reason}")
+FEATURE_COLUMNS = [
+    'max_altitude', 'range_total', 'apogee_fraction', 'flight_time_steps',
+    'mean_speed', 'max_speed', 'min_speed', 'speed_std', 'mean_accel',
+    'accel_std', 'launch_angle_deg', 'impact_angle_deg', 'aspect_ratio',
+    'ascent_descent_ratio', 'curvature_proxy', 'vy_sign_changes',
+]
+
+
+# ---------------------------------------------------------------------------
+# 3. DATASET GENERATION
+# ---------------------------------------------------------------------------
+
+def build_dataset(n_per_class=400, noise_max=5.0, seed=RANDOM_SEED):
+    np.random.seed(seed)
+    rows, labels = [], []
+    for label, sim_fn in SIMULATORS.items():
+        for _ in range(n_per_class):
+            noise = np.random.uniform(0, noise_max)
+            xs, ys = sim_fn(noise)
+            rows.append(extract_features(xs, ys))
+            labels.append(label)
+    df = pd.DataFrame(rows)
+    df['label'] = labels
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. TRAIN / EVALUATE
+# ---------------------------------------------------------------------------
+
+def train_model(df, model=None):
+    X = df[FEATURE_COLUMNS].values
+    y = df['label'].values
+
+    label_encoder = LabelEncoder()
+    y_enc = label_encoder.fit_transform(y)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_enc, test_size=0.25, stratify=y_enc, random_state=RANDOM_SEED)
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    if model is None:
+        model = RandomForestClassifier(
+            n_estimators=200, max_depth=10, random_state=RANDOM_SEED)
+
+    model.fit(X_train_s, y_train)
+    preds = model.predict(X_test_s)
+
+    print(f"Test accuracy: {accuracy_score(y_test, preds):.4f}\n")
+    print(classification_report(y_test, preds, target_names=label_encoder.classes_))
+    print("Confusion matrix (rows=true, cols=predicted):")
+    print(pd.DataFrame(
+        confusion_matrix(y_test, preds),
+        index=label_encoder.classes_, columns=label_encoder.classes_))
+
+    return model, scaler, label_encoder
+
+
+def save_artifacts(model, scaler, label_encoder, path_prefix='trajectory_model'):
+    joblib.dump(model, f'{path_prefix}.joblib')
+    joblib.dump(scaler, f'{path_prefix}_scaler.joblib')
+    joblib.dump(label_encoder, f'{path_prefix}_labels.joblib')
+    print(f"Saved: {path_prefix}.joblib, {path_prefix}_scaler.joblib, "
+          f"{path_prefix}_labels.joblib")
+
+
+def load_artifacts(path_prefix='trajectory_model'):
+    model = joblib.load(f'{path_prefix}.joblib')
+    scaler = joblib.load(f'{path_prefix}_scaler.joblib')
+    label_encoder = joblib.load(f'{path_prefix}_labels.joblib')
+    return model, scaler, label_encoder
+
+
+def classify_csv(csv_path, model, scaler, label_encoder):
+    """csv_path must contain columns 'x' and 'y' (2D coordinates in order)."""
+    points = pd.read_csv(csv_path)
+    xs, ys = points['x'].values, points['y'].values
+    frame_object = 480
+    new_y_axis = frame_object - np.array(ys)
+    ys = new_y_axis
+    feats = extract_features(xs, ys)
+    X = np.array([[feats[c] for c in FEATURE_COLUMNS]])
+    X_s = scaler.transform(X)
+    pred_idx = model.predict(X_s)[0]
+    proba = model.predict_proba(X_s)[0] if hasattr(model, 'predict_proba') else None
+    label = label_encoder.inverse_transform([pred_idx])[0]
+    print(f"Predicted class: {label}")
+    if proba is not None:
+        for cls, p in sorted(zip(label_encoder.classes_, proba), key=lambda t: -t[1]):
+            print(f"  {cls:22s} {p:.3f}")
+    return label
+
+
+# ---------------------------------------------------------------------------
+# Graphing the trajectory from CSV
+# ---------------------------------------------------------------------------
+
+def trajectory_graph(csv_path):
+    array = np.array(pd.read_csv(csv_path)[['x', 'y']].values)
+    frame_object = 480
+    new_y_axis = frame_object - np.array([point[1] for point in array])
+    # Convert the array to a DataFrame
+    df = pd.DataFrame(array, columns=['x', 'y'])
+    df['y'] = new_y_axis
+
+    # Save the DataFrame to a CSV file
+    df.to_csv(csv_path, index=False)
+
+    # Plot the trajectory
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_aspect('equal', adjustable='box')
+    ax.invert_yaxis()  # Invert y-axis to match the coordinate system
+    ax.set_xlim(0, 1000)
+    ax.set_ylim(1000, 0)
+    ax.plot(df['x'], df['y'], marker='o', linestyle='-', color='blue')
+    ax.set_xlabel('Downrange Distance (m)')
+    ax.set_ylabel('Altitude (m)')
+    ax.set_title('Trajectory')
+    ax.grid(True)
+    plt.show()
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="2D Trajectory Classifier")
+    parser.add_argument('--train', action='store_true', help="Train a fresh model on simulated data")
+    parser.add_argument('--classify', type=str, default=None,
+                         help="Path to CSV with columns x,y to classify")
+    parser.add_argument('--n_per_class', type=int, default=400)
+    args = parser.parse_args()
+
+    if args.train:
+        df = build_dataset(n_per_class=args.n_per_class)
+        model, scaler, label_encoder = train_model(df)
+        save_artifacts(model, scaler, label_encoder)
+
+    if args.classify:
+        try:
+            model, scaler, label_encoder = load_artifacts()
+        except FileNotFoundError:
+            print("No trained model found. Run with --train first.")
+            sys.exit(1)
+        classify_csv(args.classify, model, scaler, label_encoder)
+        trajectory_graph(args.classify)
+
+    if not args.train and not args.classify:
+        print("No action specified. Running a full train + demo cycle...\n")
+        df = build_dataset(n_per_class=args.n_per_class)
+        model, scaler, label_encoder = train_model(df)
+        save_artifacts(model, scaler, label_encoder)
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+# ---------------------------------------------------------------------------
+# NEXT STEPS / HOW TO GROW THIS PROJECT
+# ---------------------------------------------------------------------------
+# 1. Real sensor data: replace SIMULATORS with trajectories from your own
+#    optical tracking / radar pipeline (x, y pixel or geo-coordinates over
+#    time). Keep timestamps if your sampling rate is irregular, and resample
+#    to a fixed dt before feature extraction, or use time-aware features.
+#
+# 2. Sequence models (no feature engineering): feed the raw (x, y) series
+#    directly into an LSTM/GRU/1D-CNN using padded sequences
+#    (tf.keras.preprocessing.sequence.pad_sequences or PyTorch
+#    pack_padded_sequence). This captures temporal patterns feature
+#    engineering might miss, at the cost of needing more data.
+#
+# 3. Early/partial-trajectory classification: many real systems must
+#    classify during the boost phase, before the full flight is observed.
+#    Try training on truncated versions of each trajectory (e.g. first 20%,
+#    40%, 60% of points) so the model works with partial observations too.
+#
+# 4. Dynamic time warping + k-NN: an alternative to feature engineering
+#    that works well on raw variable-length trajectories (see "Similarity-
+#    Based Launch Classification Tool", Dichter et al. 2021). Useful when
+#    you don't trust hand-crafted features to generalize.
+#
+# 5. Add realistic sensor noise/occlusion models matching your actual
+#    tracking hardware (dropped frames, quantization, jitter) so the
+#    classifier is robust to real deployment conditions.
+#
+# 6. Track uncertainty: use model.predict_proba() and require a confidence
+#    threshold before acting on a classification, especially important
+#    for early-flight (low-information) predictions.
+
+
