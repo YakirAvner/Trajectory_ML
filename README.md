@@ -16,7 +16,7 @@ Code Components contain 2 stages:
         2. Is it a missile or not, 
         3. What is the predicted trajectory after index n-1. 
 
-PyTorch Stage: 
+Scikit-Learn Stage: 
     1. The input data must be the raw data inputted by the user for optimal analysis and training,
     2. The model will use a Density Based Spatial Clustering of Applications with Noise (DBSCAN) algorithm. This algorithm
        uses a circled shape called an **"Epsilon Neighborhood" (EN)** which is placed randomly on a graph of points, and groups the points to automatically trace the shape by moving the EH through the points, in this case, of the trajectory.
