@@ -1,9 +1,5 @@
-import argparse
-import datetime
-import matplotlib.pyplot as plt
-import numpy
-import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+import numpy as np
+from sklearn.cluster import HDBSCAN
 import torch
 import torch.nn as nn
 
@@ -18,7 +14,9 @@ class LSTMAutoencoder(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.encoder_lstm = nn.LSTM(input_dim, latent_dim, batch_first=True)
-        self.decoder_lstm = nn.LSTM(latent_dim, input_dim, batch_first=True)
+        # The decoder keeps a 32-size memory and a Linear layer maps each step back to an (x, y) pair
+        self.decoder_lstm = nn.LSTM(latent_dim, latent_dim, batch_first=True)
+        self.output_layer = nn.Linear(latent_dim, input_dim)
 
     def encode(self, packed_sequences):
         """Passes raw packed data down into the uniform Latent Space vector."""
@@ -30,14 +28,14 @@ class LSTMAutoencoder(nn.Module):
         """Runs the combined training pipeline."""
         # Step 1: Compress to Latent Space
         latent_vector = self.encode(packed_sequences)
-        batch_size = latent_vector.size(0)
-        
+
         # Step 2: Prepare Latent Space vector as sequential steps for the Decoder
         # We repeat the static vector across the required timeline length
         decoder_input = latent_vector.unsqueeze(1).repeat(1, target_padded_len, 1)
-        
+
         # Step 3: Reconstruct the full 2D trajectory array
-        reconstructed_out, _ = self.decoder_lstm(decoder_input)
+        decoder_out, _ = self.decoder_lstm(decoder_input)
+        reconstructed_out = self.output_layer(decoder_out)
         return reconstructed_out, latent_vector
     
     
@@ -138,56 +136,74 @@ raw_trajectory_input = [
 # ==========================================
 
 
+NUM_EPOCHS = 300
+torch.manual_seed(0)
+
 lengths = [len(t) for t in raw_trajectory_input]
 max_len = max(lengths)
-scaler = MinMaxScaler(feature_range=(0, 1))
-normalize_data = [
-    torch.tensor(MinMaxScaler(feature_range=(0, 1)).fit_transform(t), dtype=torch.float32) 
-    for t in raw_trajectory_input
-]
+
+# 1. Normalize: move every trajectory to start at (0, 0), then divide ALL trajectories by one shared scale.
+#    A per-trajectory / per-axis scaler would stretch every track to fill a 0-1 box and erase size and aspect ratio,
+#    making a tiny jitter look like a long flight.
+origin_tracks = [np.asarray(t, dtype=np.float32) - np.asarray(t[0], dtype=np.float32) for t in raw_trajectory_input]
+global_scale = max(np.abs(t).max() for t in origin_tracks)
+normalize_data = [torch.tensor(t / global_scale, dtype=torch.float32) for t in origin_tracks]
 
 # 2. Pad arrays for temporary tensor structure, then pack natively for the LSTM
-tracks = [t.detach().clone().float() for t in normalize_data]
-padded_tracks = nn.utils.rnn.pad_sequence(tracks, batch_first=True)
+padded_tracks = nn.utils.rnn.pad_sequence(normalize_data, batch_first=True)
 packed_inputs = nn.utils.rnn.pack_padded_sequence(
     padded_tracks, lengths, batch_first=True, enforce_sorted=False
 )
 
-# 3. Initialize Model, Loss Function, and Optimizing Engine
+# Binary mask so zero padding coordinates don't affect our error score
+mask = torch.zeros_like(padded_tracks)
+for idx, l in enumerate(lengths):
+    mask[idx, :l, :] = 1.0
+
+# 3. Initialize Model and Optimizing Engine
 model = LSTMAutoencoder(input_dim=2, latent_dim=32)
-criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
 # 4. Running the Training Process
 print("Training the internal model settings...")
 model.train()
-for epoch in range(100): # Training loop iterations
+for epoch in range(NUM_EPOCHS):
     optimizer.zero_grad()
-    
+
     # Generate full output arrays from encoder-decoder pipeline
     reconstructions, latent_embeddings = model(packed_inputs, max_len)
-    
-    # SCORE CHECK PHASE: Compare fully generated tracks to original raw tracks
-    # We use a custom binary mask to ensure zero padding coordinates don't affect our error score
-    mask = torch.zeros_like(padded_tracks)
-    for idx, l in enumerate(lengths):
-        mask[idx, :l, :] = 1.0
-        
-    loss = criterion(reconstructions * mask, padded_tracks * mask)
-    
-    # BACKPROPAGATION PHASE: Tweak internal neural settings based on score
+
+    # SCORE CHECK PHASE: MSE averaged over the real (unpadded) coordinates only
+    loss = (((reconstructions - padded_tracks) ** 2) * mask).sum() / mask.sum()
+
+    # BACKPROPAGATION PHASE: compute each weight's share of the error and adjust the weights to reduce it
     loss.backward()
     optimizer.step()
-    
-    if (epoch + 1) % 20 == 0:
-        print(f"Epoch [{epoch+1}/100] | Shape Match Error (MSE): {loss.item():.4f}")
+
+    if (epoch + 1) % 50 == 0:
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Shape Match Error (MSE): {loss.item():.6f}")
 
 print("\nModel trained successfully!")
 
 
 # ==========================================
-# 3. Clustering with Scikit-Learn's DBSCAN
+# 3. Clustering with Scikit-Learn's HDBSCAN
 # ==========================================
 
 
+# 1. Extract the 32-number latent vector of every trajectory from the trained encoder
+model.eval()
+with torch.no_grad():
+    latent_vectors = model.encode(packed_inputs).numpy()
+
+# 2. Group the latent vectors by density; trajectories that fit no group get label -1 (noise).
+#    min_cluster_size=2 because this sample set is tiny; raise it when training on real data volumes.
+clusterer = HDBSCAN(min_cluster_size=2, min_samples=1, copy=True)
+cluster_labels = clusterer.fit_predict(latent_vectors)
+
+# 3. Report each trajectory's cluster and how strongly it belongs to it
+print("\nHDBSCAN Clustering Results:")
+for idx, (label, strength) in enumerate(zip(cluster_labels, clusterer.probabilities_)):
+    cluster_name = "Noise" if label == -1 else f"Cluster {label}"
+    print(f"Trajectory #{idx} ({lengths[idx]} points) -> {cluster_name} | Membership strength: {strength:.2f}")
 
