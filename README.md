@@ -20,7 +20,7 @@ Code Components contain 2 stages:
 
 **PyTorch Stage:**
 
-    1. The input data must be the raw data inputted by the user for optimal analysis and training,
+    1. The input data must be the raw data inputted by the user for optimal analysis and training.
 
     2. The data is then sent to the LSTM Autoencoder. This encodes the raw data by compressing it to a size of 32 number array.
 
@@ -60,29 +60,14 @@ Code Components contain 2 stages:
 
          4. Finally, a MSE loss function is used to score how the decoded array differs from the raw data. Furthermore, when training the 
             model, the data accumulated from training helps improve new data statictics by using a method called **backpropagation**.
-            This terminology refers to how the ML model uses its past traning logs as a performance review and compares the error scores for every trained data to the new data inputted. As a result, the more data it trains on, the better the optimization is for 
-            enhancing its knowledge to predict trajectory shapes more precisely. 
+            This terminology refers to how the ML model uses its past traning logs as a performance review and compares the error scores for every trained data to the new data inputted. 
+            As a result, the more data it trains on, the better the optimization is for enhancing its knowledge to predict trajectory shapes more precisely. 
          
 
 **Scikit-Learn Stage:** 
     1. The input data must be the compressed data inputted by the autoencoder for optimal analysis and training different clusters.
 
-    2. The model will use a Density Based Spatial Clustering of Applications with Noise (DBSCAN) algorithm. This algorithm
-       uses a circled shape called an **"Epsilon Neighborhood" (EN)** which is placed randomly on a graph of points, and groups the points to automatically trace the shape by moving the EH through the points, in this case, of the trajectory.
+    2. The model will use a Hierarchial Density Based Spatial Clustering of Applications with Noise (HDBSCAN) algorithm. This algorithm takes every point inputted and checks its core distance 
+       from every other point in the array. 
 
-    3. The DBSCAN algorithm chooses an unvisited coordinate as its initial point. 
-
-    4. Next, it takes that point and places a circle (the EN) around it and checks how much density is in the radius of the EN
-       according to a key parameter called the **minPTs** - initialized by the user - analyzing the number of points in the surface of the 
-       circle. 
-
-       4.1. If the number of points (P#) >= minPts: This is called a core point,
-
-       4.2. If P# < minPTs: This is called a border point,
-
-       4.3. If there are points that are part of any trajectory: This indicates as noise in the model. 
-
-    5. Then, this part is the essential part of the DBSCAN algorithm. When identifying a core point, the EN moves to its neighbors
-       creating a new circle  for these neighbor points. For each neighbor point that is identified, as well, as a core point, the EN
-       keeps on hopping to each neighbor in the trajectory's coordinates until the value of P# < minPTs; indicating as a border point
-       and finishes analyzing the trajectory's shape.
+    3. 
